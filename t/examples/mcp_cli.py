@@ -14,6 +14,8 @@ import importlib.util
 import io
 import json
 import re
+import shlex
+import sys
 
 
 # The client of the command line of examples/mcp_cli.py, whose user agent requests the applications of the test, without
@@ -209,6 +211,17 @@ with subtest('Errors'):
         (1, '/mcp: 400 Bad Request: Bad Request: Unsupported protocol version (supported versions: 2025-11-25)\n'),
         'text of the error of HTTP',
     )
+
+with subtest('Transport stdio'):
+    # The server in a child process, which the client starts and ends
+    stdio = shlex.join([sys.executable, ROOT.child('examples', 'calculator.py').to_str(), 'stdio'])
+    with contextlib.redirect_stdout(io.StringIO()) as stdout, contextlib.redirect_stderr(io.StringIO()) as stderr:
+        code = cli.main(['-c', stdio, 'add', '-a', '1', '-b', '2'])
+    is_deeply_ok((code, stdout.getvalue(), stderr.getvalue()), (0, '3.0\n', ''), 'result')
+    with contextlib.redirect_stdout(io.StringIO()) as stdout, contextlib.redirect_stderr(io.StringIO()) as stderr:
+        code = cli.main(['--command', '/nonexistent/server', 'add'])
+    is_ok(code, 1, 'no program')
+    like_ok(stderr.getvalue(), re.compile(r'^/nonexistent/server: .*No such file'), 'message')
 
 cli.ua.close()
 

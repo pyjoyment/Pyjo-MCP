@@ -125,16 +125,21 @@ the lists of objects, or JSON:
 uv run python examples/mcp_cli.py --help
 uv run python examples/mcp_cli.py forecast --place Kraków --language pl --days 2
 uv run python examples/mcp_cli.py hourly-forecast -p Warsaw -H 6 -f json
+uv run python examples/mcp_cli.py -c 'uv run python examples/calculator.py stdio' add -a 1 -b 2
 ```
 
 It is made with `Pyjo.MCP.Client`, a client of MCP over Streamable HTTP, which
-sends the `_meta` and the headers that every request carries:
+sends the `_meta` and the headers that every request carries, or over the
+transport stdio, of a server that it starts itself:
 
 ```python
 from Pyjo.MCP.Client import Client
 
 client = Client('http://127.0.0.1:3000/mcp')
 print(client.call_tool('divide', {'a': 7, 'b': 2})['structuredContent'])
+
+with Client(command=['uv', 'run', 'python', 'examples/calculator.py', 'stdio']) as client:
+    print(client.call_tool('divide', {'a': 7, 'b': 2})['structuredContent'])
 ```
 
 `Pyjo.MCP.Test` tests a server with the requests of the client, without

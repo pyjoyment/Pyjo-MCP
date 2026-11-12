@@ -19,6 +19,10 @@ Pyjo.MCP.Client - Client of MCP
     # Non-blocking
     client.call_tool_p('add', {'a': 1, 'b': 2}).then(lambda result: print(result['structuredContent'])).wait()
 
+    # The transport stdio, of a server in a child process
+    with Pyjo.MCP.Client.new(command=['python', 'calculator.py', 'stdio']) as client:
+        print(client.call_tool('add', {'a': 1, 'b': 2})['structuredContent'])
+
 :mod:`Pyjo.MCP.Client` is a client of the Model Context Protocol over
 Streamable HTTP, of the revision :data:`Pyjo.MCP.PROTOCOL_VERSION` of the
 specification, made with :mod:`Pyjo.UserAgent`. It sends what every request
@@ -27,6 +31,13 @@ client, and the headers of MCP made from the body, ``MCP-Protocol-Version``,
 ``Mcp-Method``, ``Mcp-Name`` and the ``Mcp-Param-{name}`` of the
 ``x-mcp-header`` of a tool, and reads the response in JSON or in a stream of
 events.
+
+With a :attr:`~Pyjo_MCP_Client.command`, it speaks the transport stdio
+instead: it runs the server in a child process of
+:mod:`Pyjo.IOLoop.ChildProcess` at its first request, and sends the messages
+to its standard input and reads them from its standard output, one on each
+line, with :mod:`Pyjo.IOLoop.Messages`. The methods are the same for both
+transports.
 
 It is a client to test a server with and to start from, not an agent: it
 caches nothing for the ``ttlMs`` of a result, and leaves the authorization to
@@ -44,6 +55,9 @@ Classes
 
 import Pyjo.EventEmitter
 import Pyjo.Exception
+import Pyjo.IOLoop
+import Pyjo.IOLoop.ChildProcess
+import Pyjo.IOLoop.Messages
 import Pyjo.JSON
 import Pyjo.JSON.RPC
 import Pyjo.Promise
@@ -58,11 +72,14 @@ from .. import MCP
 from . import Tool
 
 import builtins
+import os
 import re
+import signal
+import sys
 import weakref
 
-from collections.abc import Callable
-from typing import Any, cast
+from collections.abc import Callable, Mapping, Sequence
+from typing import Any, Self, cast
 
 
 type Anything = builtins.object
@@ -103,9 +120,24 @@ class Pyjo_MCP_Client(Pyjo.EventEmitter.object):
             ...
 
     Emitted for every message of the stream of events of a response that is
-    not the response itself, as a notification of the progress of a tool. ::
+    not the response itself, as a notification of the progress of a tool, or,
+    over the transport stdio, for every notification of the server that is not
+    a message of a subscription of :meth:`listen`. ::
 
         client.on('notification', lambda client, message: print(message['method']))
+
+    ``stderr`` ::
+
+        @client.on('stderr')
+        def stderr(client, chunk):
+            ...
+
+    Emitted for the standard error of the server of the transport stdio, as
+    :class:`bytes`, which goes to the standard error of this process without
+    a subscriber. The specification lets a server log there, so it is not an
+    error of the server. ::
+
+        client.on('stderr', lambda client, chunk: log.debug(chunk.decode(errors='replace')))
     """
 
     def __init__(
@@ -114,16 +146,65 @@ class Pyjo_MCP_Client(Pyjo.EventEmitter.object):
         ua: Pyjo.UserAgent.object | None = None,
         name: str = 'Pyjo.MCP',
         version: str = '1.0.0',
+        *,
+        command: Sequence[str] | None = None,
+        cwd: str | os.PathLike[str] | None = None,
+        env: Mapping[str, str] | None = None,
     ) -> None:
         """::
 
             client = Pyjo.MCP.Client.new()
             client = Pyjo.MCP.Client.new('http://127.0.0.1:3000/mcp', name='calculator-client', version='2.0.0')
             client = Pyjo.MCP.Client.new('/mcp', ua=t.ua)
+            client = Pyjo.MCP.Client.new(command=['uv', 'run', 'app.py', 'stdio'], cwd='/srv/app', env={'DEBUG': '1'})
 
-        Construct a new :mod:`Pyjo.MCP.Client` object.
+        Construct a new :mod:`Pyjo.MCP.Client` object, of Streamable HTTP, or
+        of the transport stdio with a ``command``.
         """
         super().__init__()
+
+        self.command: list[str] | None = list(command) if command is not None else None
+        """::
+
+            command = client.command
+            client.command = ['uv', 'run', 'app.py', 'stdio']
+
+        The program and the arguments of the server of the transport stdio,
+        which the client runs in a child process at its first request, and
+        again at the first request after the process has exited, or ``None``
+        for Streamable HTTP of :attr:`url`, the default.
+        """
+
+        self.cwd = cwd
+        """::
+
+            cwd = client.cwd
+            client.cwd = '/srv/app'
+
+        The working directory of the server of :attr:`command`, the one of this
+        process by default.
+        """
+
+        self.env: dict[str, str] = dict(env or {})
+        """::
+
+            env = client.env
+            client.env = {'DEBUG': '1'}
+
+        The variables of the environment of the server of :attr:`command`,
+        over the ones of this process, an empty :class:`dict` by default.
+        """
+
+        self.shutdown_timeout: float = 5
+        """::
+
+            timeout = client.shutdown_timeout
+            client.shutdown_timeout = 1
+
+        How long :meth:`close` waits for the server of :attr:`command` to exit
+        after the end of its standard input, and then after ``SIGTERM``,
+        before ``SIGKILL``, in seconds, ``5`` by default.
+        """
 
         self.capabilities: dict[str, Any] = {}
         """::
@@ -198,10 +279,43 @@ class Pyjo_MCP_Client(Pyjo.EventEmitter.object):
 
         self._id = 0
         self._ua = ua
+        self._own_ua = False
         # The response of a stream of events, which the parser of the content takes from the body
         self._responses: weakref.WeakKeyDictionary[Pyjo.Transaction.HTTP.object, dict[str, Any]] = (
             weakref.WeakKeyDictionary()
         )
+
+        # The server of the transport stdio, the requests that wait for their responses, and the subscriptions
+        self._process: Pyjo.IOLoop.ChildProcess.object | None = None
+        self._messages: Pyjo.IOLoop.Messages.object | None = None
+        self._pending: dict[Any, Pyjo.Promise.object] = {}
+        self._requests: dict[Any, dict[str, Any]] = {}
+        self._listeners: dict[Any, Callable[[dict[str, Any]], Any]] = {}
+
+    def __enter__(self) -> Self:
+        return self
+
+    def __exit__(self, *args: Any) -> None:
+        self.close()
+
+    async def __aenter__(self) -> Self:
+        return self
+
+    async def __aexit__(self, *args: Any) -> None:
+        await self.close_p()
+
+    @property
+    def process(self) -> Pyjo.IOLoop.ChildProcess.object | None:
+        """::
+
+            process = client.process
+
+        The :mod:`Pyjo.IOLoop.ChildProcess` of the server of :attr:`command`
+        while it runs, or ``None``. ::
+
+            print(client.process.pid)
+        """
+        return self._process
 
     @property
     def ua(self) -> Pyjo.UserAgent.object:
@@ -214,11 +328,13 @@ class Pyjo_MCP_Client(Pyjo.EventEmitter.object):
         """
         if self._ua is None:
             self._ua = Pyjo.UserAgent.new()
+            self._own_ua = True
         return self._ua
 
     @ua.setter
     def ua(self, value: Pyjo.UserAgent.object) -> None:
         self._ua = value
+        self._own_ua = False
 
     def build_notification(self, method: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
         """::
@@ -329,7 +445,63 @@ class Pyjo_MCP_Client(Pyjo.EventEmitter.object):
         Same as :meth:`call_tool`, but returns a :mod:`Pyjo.Promise` of the
         result instead of blocking.
         """
-        return self.send_request_p(self._call_tool(name, arguments, input_responses, request_state)).then(_result)
+        return _then(self.send_request_p(self._call_tool(name, arguments, input_responses, request_state)), _result)
+
+    def close(self) -> None:
+        """::
+
+            client.close()
+
+        End the server of :attr:`command`, as the specification asks of a
+        client of the transport stdio: close its standard input, wait
+        :attr:`shutdown_timeout` seconds for it to exit, then send ``SIGTERM``,
+        and ``SIGKILL`` after as long again, and block until it has exited.
+        The requests in progress fail. A client of Streamable HTTP closes the
+        connections of its :attr:`ua`, unless the user agent was given to it.
+        A ``with`` block closes the client at its end. ::
+
+            with Pyjo.MCP.Client.new(command=['python', 'calculator.py', 'stdio']) as client:
+                print(client.list_tools()['tools'])
+        """
+        if self._process is None:
+            self.close_p()
+            return
+        _wait(self.close_p())
+
+    def close_p(self) -> Pyjo.Promise.object:
+        """::
+
+            promise = client.close_p()
+
+        Same as :meth:`close`, but returns a :mod:`Pyjo.Promise` that is
+        fulfilled once the server has exited, instead of blocking. An
+        ``async with`` block closes the client with it. ::
+
+            async with Pyjo.MCP.Client.new(command=['python', 'calculator.py', 'stdio']) as client:
+                print((await client.list_tools_p())['tools'])
+        """
+        if self._own_ua and self._ua is not None:
+            self._ua.close()
+        if (process := self._process) is None or (messages := self._messages) is None:
+            return Pyjo.Promise.resolve()
+        loop = Pyjo.IOLoop.singleton
+        timers: list[str] = []
+
+        def kill(loop: Any) -> None:
+            process.kill(signal.SIGKILL)
+
+        def terminate(loop: Any) -> None:
+            process.kill(signal.SIGTERM)
+            timers.append(loop.timer(self.shutdown_timeout, kill))
+
+        def closed(*args: Any) -> None:
+            for timer in timers:
+                loop.remove(timer)
+
+        promise = process.once_p('close').then(closed)
+        timers.append(loop.timer(self.shutdown_timeout, terminate))
+        messages.close_gracefully()
+        return promise
 
     def complete(
         self, ref: dict[str, Any], argument: str, value: str, arguments: dict[str, str] | None = None
@@ -358,7 +530,7 @@ class Pyjo_MCP_Client(Pyjo.EventEmitter.object):
         Same as :meth:`complete`, but returns a :mod:`Pyjo.Promise` of the
         result instead of blocking.
         """
-        return self.send_request_p(self._complete(ref, argument, value, arguments)).then(_result)
+        return _then(self.send_request_p(self._complete(ref, argument, value, arguments)), _result)
 
     def discover(self) -> dict[str, Any]:
         """::
@@ -378,7 +550,7 @@ class Pyjo_MCP_Client(Pyjo.EventEmitter.object):
         Same as :meth:`discover`, but returns a :mod:`Pyjo.Promise` of the
         result instead of blocking.
         """
-        return self.send_request_p(self.build_request('server/discover')).then(_result)
+        return _then(self.send_request_p(self.build_request('server/discover')), _result)
 
     def get_prompt(
         self,
@@ -421,7 +593,7 @@ class Pyjo_MCP_Client(Pyjo.EventEmitter.object):
         Same as :meth:`get_prompt`, but returns a :mod:`Pyjo.Promise` of the
         result instead of blocking.
         """
-        return self.send_request_p(self._get_prompt(name, arguments, input_responses, request_state)).then(_result)
+        return _then(self.send_request_p(self._get_prompt(name, arguments, input_responses, request_state)), _result)
 
     def list_prompts(self) -> dict[str, Any]:
         """::
@@ -443,7 +615,7 @@ class Pyjo_MCP_Client(Pyjo.EventEmitter.object):
         Same as :meth:`list_prompts`, but returns a :mod:`Pyjo.Promise` of the
         result instead of blocking.
         """
-        return self.send_request_p(self.build_request('prompts/list')).then(_result)
+        return _then(self.send_request_p(self.build_request('prompts/list')), _result)
 
     def list_resources(self) -> dict[str, Any]:
         """::
@@ -465,7 +637,7 @@ class Pyjo_MCP_Client(Pyjo.EventEmitter.object):
         Same as :meth:`list_resources`, but returns a :mod:`Pyjo.Promise` of
         the result instead of blocking.
         """
-        return self.send_request_p(self.build_request('resources/list')).then(_result)
+        return _then(self.send_request_p(self.build_request('resources/list')), _result)
 
     def list_resource_templates(self) -> dict[str, Any]:
         """::
@@ -488,7 +660,7 @@ class Pyjo_MCP_Client(Pyjo.EventEmitter.object):
         Same as :meth:`list_resource_templates`, but returns a
         :mod:`Pyjo.Promise` of the result instead of blocking.
         """
-        return self.send_request_p(self.build_request('resources/templates/list')).then(_result)
+        return _then(self.send_request_p(self.build_request('resources/templates/list')), _result)
 
     def list_tools(self) -> dict[str, Any]:
         """::
@@ -514,7 +686,7 @@ class Pyjo_MCP_Client(Pyjo.EventEmitter.object):
         Same as :meth:`list_tools`, but returns a :mod:`Pyjo.Promise` of the
         result instead of blocking.
         """
-        return self.send_request_p(self.build_request('tools/list')).then(_result)
+        return _then(self.send_request_p(self.build_request('tools/list')), _result)
 
     def listen(self, notifications: dict[str, Any], cb: Callable[[dict[str, Any]], Any]) -> dict[str, Any] | None:
         """::
@@ -544,7 +716,13 @@ class Pyjo_MCP_Client(Pyjo.EventEmitter.object):
             updated.count = 0
             client.listen({'resourceSubscriptions': ['file:///project/README.md']}, updated)
             print(client.read_resource('file:///project/README.md')['contents'][0]['text'])
+
+        Over the transport stdio, the messages of the subscription are those of
+        the ``subscriptionId`` of its request, and the function closes it with
+        ``notifications/cancelled``.
         """
+        if self.command is not None:
+            return _wait(self.listen_p(notifications, cb))
         tx, finished = self._listen(notifications, cb)
         return finished(self.ua.start(tx))
 
@@ -556,6 +734,8 @@ class Pyjo_MCP_Client(Pyjo.EventEmitter.object):
         Same as :meth:`listen`, but returns a :mod:`Pyjo.Promise` of the
         result instead of blocking.
         """
+        if self.command is not None:
+            return self._listen_stdio_p(notifications, cb)
         tx, finished = self._listen(notifications, cb)
 
         def failed(e: Any) -> Any:
@@ -591,7 +771,7 @@ class Pyjo_MCP_Client(Pyjo.EventEmitter.object):
         Same as :meth:`read_resource`, but returns a :mod:`Pyjo.Promise` of
         the result instead of blocking.
         """
-        return self.send_request_p(self._read_resource(uri, input_responses, request_state)).then(_result)
+        return _then(self.send_request_p(self._read_resource(uri, input_responses, request_state)), _result)
 
     def read_response(self, tx: Pyjo.Transaction.HTTP.object, request: dict[str, Any]) -> dict[str, Any] | None:
         """::
@@ -608,10 +788,7 @@ class Pyjo_MCP_Client(Pyjo.EventEmitter.object):
             tx = client.ua.start(client.build_tx(request))
             print(client.read_response(tx, request)['result']['tools'])
         """
-        response = self._read_response(tx, request)
-        if request.get('method') == 'tools/list' and isinstance(result := _object(response).get('result'), dict):
-            response = {**_object(response), 'result': self._tools(cast(dict[str, Any], result))}
-        return response
+        return self._response(request, self._read_response(tx, request))
 
     def send_request(self, request: dict[str, Any]) -> dict[str, Any] | None:
         """::
@@ -619,14 +796,22 @@ class Pyjo_MCP_Client(Pyjo.EventEmitter.object):
             response = client.send_request(request)
 
         Send a request or a notification and return the response, or ``None``
-        for one that the server accepted without a response, ``202
-        Accepted``. A response of HTTP without one of JSON-RPC fails with a
-        :mod:`Pyjo.Exception`, with the text of an error in plain text, as a
-        server of an older revision tells the revisions that it supports. ::
+        for a notification, which the server accepts without a response, ``202
+        Accepted`` over Streamable HTTP. A response of HTTP without one of
+        JSON-RPC fails with a :mod:`Pyjo.Exception`, with the text of an error
+        in plain text, as a server of an older revision tells the revisions
+        that it supports, and so does a server of :attr:`command` that cannot
+        run or exits before the response. ::
 
             response = client.send_request(client.build_request('tools/list'))
             print(response['result']['tools'])
+
+        Over the transport stdio, the blocking methods wait for their responses
+        with the event loop, so they cannot be called in an event loop that
+        runs already, where the methods with a promise can.
         """
+        if self.command is not None:
+            return _wait(self.send_request_p(request))
         response = self.read_response(self.ua.start(self.build_tx(request)), request)
         if self._renegotiate(request, response):
             response = self.read_response(self.ua.start(self.build_tx(request)), request)
@@ -638,19 +823,32 @@ class Pyjo_MCP_Client(Pyjo.EventEmitter.object):
             promise = client.send_request_p(request)
 
         Same as :meth:`send_request`, but returns a :mod:`Pyjo.Promise` of the
-        response instead of blocking.
-        """
+        response instead of blocking. The promise of this method, and the ones
+        of the other methods with ``_p`` but :meth:`listen_p`, abandon the
+        request when they are cancelled with
+        :meth:`~Pyjo.Promise.Pyjo_Promise.cancel`, as when the coroutine that
+        awaits them is cancelled: the connection of Streamable HTTP closes, and
+        the transport stdio sends ``notifications/cancelled``, as the
+        specification has it, and drops a response that comes after it. The
+        promise is rejected with ``Request cancelled``. ::
 
-        def response(tx: Pyjo.Transaction.HTTP.object) -> dict[str, Any] | None:
-            return self.read_response(tx, request)
+            promise = client.call_tool_p('count', {'to': 100})
+            Pyjo.IOLoop.timer(1, lambda loop: promise.cancel())
+        """
+        current: list[Pyjo.Promise.object] = []
 
         def start() -> Pyjo.Promise.object:
-            return self.ua.start_p(self.build_tx(request)).then(response)
+            current[:] = [self._send_p(request)]
+            return current[0]
 
         def renegotiate(response: Any = None) -> Any:
             return start() if self._renegotiate(request, response) else response
 
-        return start().then(renegotiate)
+        def cancel() -> None:
+            for promise in current:
+                promise.cancel()
+
+        return _cancellable(start().then(renegotiate), cancel)
 
     def _call_tool(
         self, name: str, arguments: dict[str, Any] | None, responses: dict[str, Any] | None, state: str | None
@@ -758,6 +956,141 @@ class Pyjo_MCP_Client(Pyjo.EventEmitter.object):
             message += f': {body}'
         raise Pyjo.Exception.new(message)
 
+    def _listen_stdio_p(
+        self, notifications: dict[str, Any], cb: Callable[[dict[str, Any]], Any]
+    ) -> Pyjo.Promise.object:
+        # A subscription of the transport stdio, whose messages are those of its subscriptionId, and which the function
+        # closes with notifications/cancelled, without a response
+        request = self.build_request('subscriptions/listen', {'notifications': notifications})
+        id = request['id']
+        closed = False
+
+        def message(message: dict[str, Any]) -> None:
+            nonlocal closed
+            if not closed and cb(message) is False:
+                closed = True
+                promise.cancel()
+
+        def done(response: Any = None) -> dict[str, Any]:
+            self._listeners.pop(id, None)
+            return _result(response)
+
+        def failed(e: Any = None) -> Any:
+            self._listeners.pop(id, None)
+            return None if closed else Pyjo.Promise.reject(e)
+
+        self._listeners[id] = message
+        promise = self._send_p(request)
+        return promise.then(done, failed)
+
+    def _receive(self, data: bytes) -> None:
+        # A message of the server of the transport stdio: the response of a request, a message of a subscription, or
+        # another notification
+        try:
+            message = Pyjo.JSON.decode_json(data)
+        except ValueError:
+            return
+        if not isinstance(message, dict):
+            return
+        message = cast(dict[str, Any], message)
+        if 'method' not in message:
+            if (promise := self._pending.pop(message.get('id'), None)) is not None:
+                promise.resolve(self._response(self._requests.pop(message.get('id'), {}), message))
+            return
+        meta = _object(_object(message.get('params')).get('_meta'))
+        if (listener := self._listeners.get(meta.get(MCP.META_SUBSCRIPTION_ID))) is not None:
+            listener(message)
+            return
+        self.emit('notification', message)
+
+    def _response(self, request: dict[str, Any], response: Any) -> Any:
+        # The response with the tools of a result of tools/list kept, without the ones of the event invalid_tool
+        if request.get('method') == 'tools/list' and isinstance(result := _object(response).get('result'), dict):
+            response = {**_object(response), 'result': self._tools(cast(dict[str, Any], result))}
+        return response
+
+    def _send_p(self, request: dict[str, Any]) -> Pyjo.Promise.object:
+        # One request of the transport, whose promise abandons it when it is cancelled
+        if self.command is None:
+            started = self.ua.start_p(self.build_tx(request))
+
+            def response(tx: Pyjo.Transaction.HTTP.object) -> dict[str, Any] | None:
+                return self.read_response(tx, request)
+
+            return _cancellable(started.then(response), started.cancel)
+
+        messages = self._spawn()
+        if (id := request.get('id')) is None:
+            if messages is not None:
+                messages.send(Pyjo.JSON.encode_json(request))
+            return Pyjo.Promise.resolve(None)
+
+        def cancel() -> None:
+            if self._pending.pop(id, None) is None:
+                return
+            self._requests.pop(id, None)
+            self._listeners.pop(id, None)
+            if messages is not None and self._messages is messages:
+                notification = self.build_notification('notifications/cancelled', {'requestId': id})
+                messages.send(Pyjo.JSON.encode_json(notification))
+            promise.reject(Pyjo.Exception.new('Request cancelled'))
+
+        promise = Pyjo.Promise.new(cancel=cancel)
+        self._pending[id] = promise
+        self._requests[id] = request
+        if messages is not None:
+            messages.send(Pyjo.JSON.encode_json(request))
+        return promise
+
+    def _spawn(self) -> Pyjo.IOLoop.Messages.object | None:
+        # The server of the transport stdio, which runs from the first request until it exits, or None for a program
+        # that cannot run, whose event error fails the requests
+        if self._process is not None:
+            return self._messages
+        command = self.command or []
+        name = ' '.join(command)
+        process = Pyjo.IOLoop.ChildProcess.new()
+        ref = weakref.ref(self)
+
+        # The requests in progress fail once the server is gone, and the next request runs it again
+        def ended(message: str) -> None:
+            if (client := ref()) is None or client._process is not process:
+                return
+            client._process = client._messages = None
+            pending, client._pending, client._requests, client._listeners = client._pending, {}, {}, {}
+            for promise in pending.values():
+                promise.reject(Pyjo.Exception.new(f'{name}: {message}'))
+
+        def error(process: Any, e: BaseException) -> None:
+            ended(str(e))
+
+        def close(process: Any, code: int | None, signal_: int | None) -> None:
+            ended(f'Exited with signal {signal_}' if signal_ is not None else f'Exited with code {code}')
+
+        def stderr(stream: Any, chunk: bytes) -> None:
+            if (client := ref()) is not None and client.has_subscribers('stderr'):
+                client.emit('stderr', chunk)
+            elif (buffer := getattr(sys.stderr, 'buffer', None)) is not None:
+                buffer.write(chunk)
+                buffer.flush()
+            else:
+                sys.stderr.write(chunk.decode(errors='replace'))
+
+        def receive(messages: Any, data: bytes) -> None:
+            if (client := ref()) is not None:
+                client._receive(data)
+
+        process.on('error', error)
+        process.on('close', close)
+        process.spawn(command, cwd=self.cwd, env={**os.environ, **self.env} if self.env else None)
+        self._process = process
+        if process.stdout is None or process.stdin is None or process.stderr is None:
+            return None
+        process.stderr.on('read', stderr)
+        self._messages = messages = Pyjo.IOLoop.Messages.new(process.stdout, output=process.stdin)
+        messages.on('message', receive)
+        return messages
+
     def _tools(self, result: dict[str, Any]) -> dict[str, Any]:
         # The tools whose x-mcp-header the specification allows, as a client excludes the others
         def nothing(**arguments: Any) -> None:
@@ -780,6 +1113,21 @@ class Pyjo_MCP_Client(Pyjo.EventEmitter.object):
             definitions.append(definition)
         self.tools = tools
         return {**result, 'tools': definitions}
+
+
+def _cancellable(promise: Pyjo.Promise.object, cancel: Callable[[], Any]) -> Pyjo.Promise.object:
+    # A promise of the value of another one, which cancels what the other one waits for, as a promise of then does not
+    cancellable = Pyjo.Promise.new(cancel=cancel)
+
+    # Without returning the promise that they settle, which the promise of then would follow and leave unhandled
+    def resolve(*values: Any) -> None:
+        cancellable.resolve(*values)
+
+    def reject(*reasons: Any) -> None:
+        cancellable.reject(*reasons)
+
+    promise.then(resolve, reject)
+    return cancellable
 
 
 def _encode(value: Any) -> str:
@@ -826,6 +1174,11 @@ def _result(response: Any) -> dict[str, Any]:
     return _object(response_.get('result'))
 
 
+def _then(promise: Pyjo.Promise.object, cb: Callable[[Any], Any]) -> Pyjo.Promise.object:
+    # The then of a promise that stays cancellable
+    return _cancellable(promise.then(cb), promise.cancel)
+
+
 def _value(arguments: Any, path: list[str]) -> Any:
     # The value of an argument at the path of its properties
     for key in path:
@@ -833,6 +1186,26 @@ def _value(arguments: Any, path: list[str]) -> Any:
             return None
         arguments = cast(dict[str, Any], arguments).get(key)
     return arguments
+
+
+def _wait(promise: Pyjo.Promise.object) -> Any:
+    # The value of a promise for a blocking method, which waits for it with the event loop, or raises its error
+    if promise.ioloop.is_running:
+        raise Pyjo.Exception.new('A blocking method cannot run in an event loop that runs already, use the one with _p')
+    results: list[Any] = []
+    errors: list[Any] = []
+
+    def done(value: Any = None) -> None:
+        results.append(value)
+
+    def failed(e: Any = None) -> None:
+        errors.append(e)
+
+    promise.then(done, failed).wait()
+    if errors:
+        e = errors[0]
+        raise e if isinstance(e, BaseException) else Pyjo.Exception.new(str(e))
+    return results[0] if results else None
 
 
 new = Pyjo_MCP_Client.new
