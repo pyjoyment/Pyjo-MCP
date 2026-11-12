@@ -1,4 +1,7 @@
+import Pyjo.IOLoop
+import Pyjo.JSON.RPC
 import Pyjo.JSON.Schema
+import Pyjo.MCP.Server
 import Pyjo.MCP.Tool
 import Pyjo.Promise
 
@@ -221,6 +224,23 @@ with subtest('Promises and coroutines'):
         raise ValueError('Secret')
 
     isa_ok(call(Pyjo.MCP.Tool.new(broken), {}), ValueError, 'exception of a coroutine rejects')
+
+    # A coroutine that the cancellation of the context stops where it waits
+    stopped = []
+
+    async def slow() -> str:
+        try:
+            await Pyjo.Promise.timer(5)
+        finally:
+            stopped.append(True)
+        return 'Too late'
+
+    context = Pyjo.MCP.Server.Context.new()
+    Pyjo.IOLoop.timer(0.01, lambda loop: context.cancel())
+    error = call(Pyjo.MCP.Tool.new(slow), {}, context)
+    isa_ok(error, Pyjo.JSON.RPC.Error, 'cancelled')
+    is_ok(error.message, 'Request cancelled', 'message')
+    is_deeply_ok(stopped, [True], 'finally of the coroutine')
 
 with subtest('Errors'):
 

@@ -204,7 +204,10 @@ class Pyjo_MCP_Prompt(Pyjo.Base.object):
         Call the function with the arguments, and return a :mod:`Pyjo.Promise`
         of the result of the prompt, as ``prompts/get`` gives it, without its
         ``resultType``, or rejected with a :class:`Pyjo.JSON.RPC.Error` of
-        arguments that are not valid, or an exception of the function. ::
+        arguments that are not valid, or an exception of the function. A
+        promise or a coroutine of the function is cancelled with the
+        :class:`Pyjo.MCP.Server.Context` of the request, as
+        :meth:`Pyjo.MCP.Server.Context.cancellable` does. ::
 
             # {'messages': [{'role': 'user', 'content': {'type': 'text', 'text': 'Review this Python code:\\nx = 1'}}]}
             prompt.get_p({'code': 'x = 1'}).then(print).wait()
@@ -226,6 +229,8 @@ class Pyjo_MCP_Prompt(Pyjo.Base.object):
         if inspect.iscoroutine(value):
             value = Pyjo.Promise.new(value)
         if isinstance(value, Pyjo.Promise.object):
+            if context is not None:
+                value = context.cancellable(value)
             return value.then(self.result)
         return Pyjo.Promise.resolve(self.result(value))
 

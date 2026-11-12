@@ -248,7 +248,9 @@ class Pyjo_MCP_Tool(Pyjo.Base.object):
         Call the function with the arguments, and return a :mod:`Pyjo.Promise`
         of the result of the tool, as ``tools/call`` gives it, without its
         ``resultType``, or rejected with an exception of the function that is not an
-        :class:`Error`, an error of the server. ::
+        :class:`Error`, an error of the server. A promise or a coroutine of the
+        function is cancelled with the :class:`Pyjo.MCP.Server.Context` of the
+        request, as :meth:`Pyjo.MCP.Server.Context.cancellable` does. ::
 
             # {'content': [{'type': 'text', 'text': '3'}], 'structuredContent': 3, 'isError': False}
             tool.call_p({'a': 1, 'b': 2}).then(print).wait()
@@ -269,6 +271,8 @@ class Pyjo_MCP_Tool(Pyjo.Base.object):
         if inspect.iscoroutine(value):
             value = Pyjo.Promise.new(value)
         if isinstance(value, Pyjo.Promise.object):
+            if context is not None:
+                value = context.cancellable(value)
 
             def failed(e: Any = None) -> Any:
                 if isinstance(e, Error):

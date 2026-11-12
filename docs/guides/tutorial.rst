@@ -141,10 +141,12 @@ asks for them in the ``_meta`` of its request, with a ``progressToken`` and
 the lowest level of the log messages that it wants, and the notifications that
 it did not ask for go nowhere. Over Streamable HTTP, the first notification
 turns the response into a stream of events, which ends with the result, when
-the client accepts one, and a client that closes the connection before the
-result cancels the request, which
-:attr:`~Pyjo.MCP.Server.Context.is_cancelled` tells. Over the transport stdio,
-the notifications are messages of the same stream:
+the client accepts one, and which a comment keeps open while the tool is
+silent. A client that closes the connection before the result cancels the
+request, which stops a tool that is a coroutine where it waits, with the
+requests of :mod:`Pyjo.UserAgent` that it waits for, and which
+:attr:`~Pyjo.MCP.Server.Context.is_cancelled` tells another one. Over the
+transport stdio, the notifications are messages of the same stream:
 
 .. literalinclude:: tutorial/progress.py
     :language: python
