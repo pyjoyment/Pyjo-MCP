@@ -3,15 +3,21 @@ import Pyjo.JSON
 import Pyjo.MCP.Client
 import Pyjo.MCP.Server
 import Pyjo.MCP.Tool
+import Pyjo.Promise
 import Pyjo.SSE
 import Pyjo.Test.Pyjo
 import Pyjo.UserAgent
 import Pyjoyment
 
+from Pyjo.File import curfile
 from Pyjo.Test import *
 
 import contextlib
 import io
+import sys
+
+
+CALCULATOR = curfile().dirname().dirname().sibling('examples', 'calculator.py').to_str()
 
 
 # The server of the examples, the calculator of the synopsis of Pyjo.MCP.Server with greet and divide, prompts and a
@@ -94,7 +100,11 @@ with subtest('Synopsis'):
 
         # Non-blocking
         client.call_tool_p('add', {'a': 1, 'b': 2}).then(lambda result: print(result['structuredContent'])).wait()
-    is_ok(stdout.getvalue(), '3\n3\n', 'printed')
+
+        # The transport stdio, of a server in a child process
+        with Pyjo.MCP.Client.new(command=[sys.executable, CALCULATOR, 'stdio']) as client:
+            print(client.call_tool('add', {'a': 1, 'b': 2})['structuredContent'])
+    is_ok(stdout.getvalue(), '3\n3\n3\n', 'printed')
 
 with subtest('invalid_tool'):
     definitions = [{'name': 'bad', 'inputSchema': {'properties': {'n': {'type': 'number', 'x-mcp-header': 'N'}}}}]
@@ -147,6 +157,21 @@ with subtest('notification'):
     is_deeply_ok(got, [{'jsonrpc': '2.0', 'method': 'notifications/progress', 'params': {'progress': 1}}], 'message')
     is_ok(stdout.getvalue(), 'notifications/progress\n', 'printed')
 
+with subtest('stderr'):
+    client = Pyjo.MCP.Client.new(command=[sys.executable, '-c', 'import sys; sys.stderr.write("Starting"); input()'])
+    got = []
+
+    @client.on('stderr')
+    def stderr(client, chunk):
+        got.append(chunk)
+
+    client.on('stderr', lambda client, chunk: print(chunk.decode(errors='replace')))
+    with contextlib.redirect_stdout(io.StringIO()) as stdout:
+        client.send_request(client.build_notification('notifications/initialized'))
+        client.close()
+    is_deeply_ok(got, [b'Starting'], 'chunk')
+    is_ok(stdout.getvalue(), 'Starting\n', 'printed')
+
 with subtest('new'):
     client = Pyjo.MCP.Client.new()
     is_ok(client.url, 'http://localhost:3000/mcp', 'url')
@@ -156,6 +181,12 @@ with subtest('new'):
     client = Pyjo.MCP.Client.new('/mcp', ua=t.ua)
     is_ok(client.discover()['supportedVersions'], ['2026-07-28'], 'user agent of the test')
     t.ua.close()
+    client = Pyjo.MCP.Client.new(command=['uv', 'run', 'app.py', 'stdio'], cwd='/srv/app', env={'DEBUG': '1'})
+    is_deeply_ok(
+        (client.command, client.cwd, client.env),
+        (['uv', 'run', 'app.py', 'stdio'], '/srv/app', {'DEBUG': '1'}),
+        'transport stdio',
+    )
 
 with subtest('Attributes'):
     client = local(Pyjo.MCP.Client.new())
@@ -182,6 +213,16 @@ with subtest('Attributes'):
     ua = client.ua
     isa_ok(ua, Pyjo.UserAgent.object, 'ua')
     client.ua = Pyjo.UserAgent.new()
+    command = client.command
+    is_ok(command, None, 'command')
+    cwd = client.cwd
+    is_ok(cwd, None, 'cwd')
+    env = client.env
+    is_deeply_ok(env, {}, 'env')
+    timeout = client.shutdown_timeout
+    is_ok(timeout, 5, 'shutdown timeout')
+    process = client.process
+    is_ok(process, None, 'process')
     meta = client.build_request('tools/list')['params']['_meta']
     is_deeply_ok(
         meta,
@@ -259,6 +300,32 @@ with subtest('call_tool_p'):
     results = []
     promise.then(results.append).wait()
     is_ok(results[0]['content'][0]['text'], 'Hello, Pyjo!', 'result')
+
+with subtest('close'):
+    with Pyjo.MCP.Client.new(command=[sys.executable, CALCULATOR, 'stdio']) as stdio:
+        is_deeply_ok([tool['name'] for tool in stdio.list_tools()['tools']][:1], ['add'], 'tools')
+        process = stdio.process
+    is_ok((stdio.process, process.exit_code), (None, 0), 'closed at the end of the block')
+    stdio = Pyjo.MCP.Client.new(command=[sys.executable, CALCULATOR, 'stdio'])
+    stdio.discover()
+    stdio.close()
+    is_ok(stdio.process, None, 'closed')
+    local(Pyjo.MCP.Client.new()).close()
+
+with subtest('close_p'):
+    stdio = Pyjo.MCP.Client.new(command=[sys.executable, CALCULATOR, 'stdio'])
+    stdio.discover()
+    promise = stdio.close_p()
+    promise.wait()
+    is_ok(stdio.process, None, 'closed')
+
+    async def main():
+        async with Pyjo.MCP.Client.new(command=[sys.executable, CALCULATOR, 'stdio']) as client:
+            return (await client.list_tools_p())['tools'][0]['name']
+
+    results = []
+    Pyjo.Promise.new(main()).then(results.append).wait()
+    is_deeply_ok(results, ['add'], 'async with')
 
 with subtest('complete'):
     # A server of its own, with completions
@@ -474,5 +541,14 @@ with subtest('send_request_p'):
     results = []
     promise.then(results.append).wait()
     is_ok(results[0]['result']['supportedVersions'], ['2026-07-28'], 'response')
+
+    stdio = Pyjo.MCP.Client.new(command=[sys.executable, CALCULATOR, 'stdio'])
+    stdio.discover()
+    promise = stdio.call_tool_p('add', {'a': 1, 'b': 2})
+    promise.cancel()
+    errors = []
+    promise.catch(errors.append).wait()
+    is_ok(errors[0].message, 'Request cancelled', 'cancelled')
+    stdio.close()
 
 done_testing()

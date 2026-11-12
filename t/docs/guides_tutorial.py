@@ -1,5 +1,6 @@
 import Pyjo.File
 import Pyjo.IOLoop
+import Pyjo.MCP.Client
 import Pyjo.MCP.Test
 
 from Pyjo.Test import *
@@ -313,6 +314,14 @@ with subtest('Standard input and output'):
     like_ok(result.stderr, re.compile(r'Greeting Pyjo'), 'log on the standard error')
     t = tutorial('stdio')
     t.call_ok('greet', name='Pyjo').status_is(200).text_content_is('Hello, Pyjo!')
+
+    # The client of the distribution, which starts the server itself
+    logged = []
+    with Pyjo.MCP.Client.new(command=[sys.executable, EXAMPLES.child('stdio.py').to_str(), 'stdio']) as client:
+        client.env = {'PYJO_LOG_LEVEL': 'info'}
+        client.on('stderr', lambda client, chunk: logged.append(chunk))
+        is_ok(client.call_tool('greet', {'name': 'Pyjo'})['content'][0]['text'], 'Hello, Pyjo!', 'client of stdio')
+    like_ok(b''.join(logged).decode(), re.compile(r'Greeting Pyjo'), 'log of the server')
 
 with subtest('Testing'):
     result = subprocess.run(

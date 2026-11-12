@@ -10,12 +10,28 @@ import Pyjo.SSE
 import Pyjo.UserAgent
 import Pyjoyment
 
+from Pyjo.File import curfile
 from Pyjo.Test import *
 
 import base64
+import os
+import re
+import signal
+import sys
+import time
 
 
 # The client of MCP over Streamable HTTP, against the server of the distribution, which checks the headers of MCP
+
+ROOT = curfile().dirname().dirname()
+CALCULATOR = ROOT.child('examples', 'calculator.py').to_str()
+TUTORIAL = ROOT.child('docs', 'guides', 'tutorial')
+
+# Servers of the transport stdio that print their directory and environment, ignore the end of their standard input,
+# and ignore SIGTERM too
+PRINTING = 'import os, sys; sys.stderr.write(os.getcwd() + " " + os.environ["EXAMPLE"]); sys.stdin.read()'
+STUBBORN = 'import sys, time; sys.stdin.read(); time.sleep(60)'
+DEAF = 'import signal, sys, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); sys.stdin.read(); time.sleep(60)'
 
 server = Pyjo.MCP.Server.new(name='ExampleServer', version='1.0.0', instructions='Utilities.')
 
@@ -602,5 +618,146 @@ with subtest('Non-blocking'):
     c = client(application(None))
     c.discover_p().catch(errors.append).wait()
     is_ok(errors[1].message, '/mcp: 404 Not Found', 'error of HTTP')
+
+with subtest('Cancellation'):
+    # A promise of a method that is cancelled closes the connection of its request
+    waiting = Pyjo.MCP.Server.new(name='ExampleServer')
+    abandoned = []
+
+    @waiting.tool(context=True)
+    def wait(context) -> str:
+        context.on('cancelled', lambda context: abandoned.append(True))
+        return Pyjo.Promise.timer(5, 'Too late')
+
+    c = client(application(waiting.to_action()))
+    errors = []
+    promise = c.call_tool_p('wait')
+    Pyjo.IOLoop.timer(0.05, lambda loop: promise.cancel())
+    promise.catch(errors.append).wait()
+    is_ok(str(errors[0]).strip(), 'Request cancelled', 'rejected')
+    Pyjo.Promise.timer(0.05).wait()
+    is_deeply_ok(abandoned, [True], 'request abandoned')
+
+with subtest('Transport stdio'):
+    # The servers of the examples and of the tutorial in a child process, as a host of MCP runs them
+    c = Pyjo.MCP.Client.new(command=[sys.executable, CALCULATOR, 'stdio'], name='ExampleClient')
+    is_ok(c.process, None, 'no process before the first request')
+    is_ok(c.discover()['capabilities'], {'tools': {}}, 'discover')
+    ok(c.process.pid, 'process')
+    is_deeply_ok([tool['name'] for tool in c.list_tools()['tools']], ['add', 'subtract', 'multiply', 'divide'], 'tools')
+    is_deeply_ok(list(c.tools), ['add', 'subtract', 'multiply', 'divide'], 'tools of the client')
+    is_ok(c.call_tool('add', {'a': 1, 'b': 2})['structuredContent'], 3, 'call')
+    is_ok(c.call_tool('divide', {'a': 1, 'b': 0})['isError'], True, 'error of a tool')
+    is_deeply_ok(error(failure(lambda: c.call_tool('power'))), (-32602, 'Unknown tool: power'), 'error of JSON-RPC')
+    is_ok(c.send_request(c.build_notification('notifications/initialized')), None, 'notification')
+    results = []
+    Pyjo.Promise.all(c.call_tool_p('add', {'a': 1, 'b': 1}), c.call_tool_p('multiply', {'a': 2, 'b': 3})).then(
+        lambda *values: results.extend(value[0]['structuredContent'] for value in values)
+    ).wait()
+    is_deeply_ok(results, [2, 6], 'requests at the same time')
+    c.close()
+    is_ok(c.process, None, 'closed')
+    is_ok(c.call_tool('add', {'a': 2, 'b': 2})['structuredContent'], 4, 'run again')
+    c.close()
+
+    # The notifications of a request, and its cancellation, which stops the coroutine of the tool
+    c = Pyjo.MCP.Client.new(command=[sys.executable, TUTORIAL.child('progress.py').to_str(), 'stdio'])
+    notifications = []
+    c.on('notification', lambda c, message: notifications.append(message['method']))
+    meta = {'progressToken': 'p1', 'io.modelcontextprotocol/logLevel': 'info'}
+    response = c.send_request(c.build_request('tools/call', {'name': 'count', 'arguments': {'to': 2}, '_meta': meta}))
+    is_ok(response['result']['structuredContent'], 2, 'result after the notifications')
+    is_deeply_ok(
+        notifications,
+        ['notifications/message', 'notifications/progress', 'notifications/progress'],
+        'notifications',
+    )
+    errors = []
+    promise = c.call_tool_p('count', {'to': 100})
+    Pyjo.IOLoop.timer(0.15, lambda loop: promise.cancel())
+    promise.catch(errors.append).wait()
+    is_ok(errors[0].message, 'Request cancelled', 'cancelled')
+    is_ok(c.call_tool('count', {'to': 1})['structuredContent'], 1, 'next request')
+    c.close()
+
+    # A multi round-trip request, whose rounds are results over stdio too
+    c = Pyjo.MCP.Client.new(command=[sys.executable, TUTORIAL.child('confirm.py').to_str(), 'stdio'])
+    c.capabilities = {'elicitation': {}}
+    result = c.call_tool('delete', {'name': 'notes.txt'})
+    is_ok(result['resultType'], 'input_required', 'input required')
+    result = c.call_tool(
+        'delete',
+        {'name': 'notes.txt'},
+        input_responses={'confirm': {'action': 'accept'}},
+        request_state=result.get('requestState'),
+    )
+    is_ok(result['content'][0]['text'], 'Deleted notes.txt', 'input responses')
+    c.close()
+
+    # A subscription, whose messages are those of its subscriptionId, and which the function closes
+    c = Pyjo.MCP.Client.new(command=[sys.executable, TUTORIAL.child('notes.py').to_str(), 'stdio'])
+    messages = []
+    c.on('notification', lambda c, message: messages.append(('other', message['method'])))
+
+    def listener(message):
+        messages.append(('listen', message['method']))
+        if len(messages) == 1:
+            c.call_tool_p('add_note', {'text': 'Buy milk'})
+        return len(messages) < 3
+
+    result = c.listen({'resourcesListChanged': True, 'resourceSubscriptions': ['notes://all']}, listener)
+    is_ok(result, None, 'closed by the function')
+    is_deeply_ok(
+        messages,
+        [
+            ('listen', 'notifications/subscriptions/acknowledged'),
+            ('listen', 'notifications/resources/list_changed'),
+            ('listen', 'notifications/resources/updated'),
+        ],
+        'messages of the subscription',
+    )
+    is_ok(c.read_resource('notes://all')['contents'][0]['text'], '* Buy milk\n', 'next request')
+    c.close()
+
+    # The standard error of the server, a program that cannot run, and a server that exits before its response
+    c = Pyjo.MCP.Client.new(command=[sys.executable, '-c', 'import sys; sys.stderr.write("Starting"); input()'])
+    chunks = []
+    c.on('stderr', lambda c, chunk: chunks.append(chunk))
+    is_ok(failure(lambda: c.list_tools()).message, f'{sys.executable} -c {c.command[2]}: Exited with code 0', 'exited')
+    is_ok(b''.join(chunks), b'Starting', 'standard error')
+    c = Pyjo.MCP.Client.new(command=['/nonexistent/server'])
+    like_ok(failure(lambda: c.list_tools()).message, re.compile(r'^/nonexistent/server: .*No such file'), 'no program')
+    c = Pyjo.MCP.Client.new(command=[sys.executable, '-c', 'import os; os.read(0, 1); os._exit(3)'])
+    like_ok(failure(lambda: c.list_tools()).message, re.compile(r': Exited with code 3$'), 'exit code')
+
+    # The directory and the environment of the server
+    c = Pyjo.MCP.Client.new(command=[sys.executable, '-c', PRINTING], cwd=TUTORIAL.to_str(), env={'EXAMPLE': '1'})
+    chunks = []
+    c.on('stderr', lambda c, chunk: chunks.append(chunk))
+    c.send_request(c.build_notification('notifications/initialized'))
+    c.close()
+    is_ok(b''.join(chunks).decode(), f'{os.path.realpath(TUTORIAL.to_str())} 1', 'cwd and env')
+
+    # A server that ignores the end of its standard input gets SIGTERM, and one that ignores SIGTERM too gets SIGKILL
+    for code, signal_, timeouts in ((STUBBORN, signal.SIGTERM, 1), (DEAF, signal.SIGKILL, 2)):
+        c = Pyjo.MCP.Client.new(command=[sys.executable, '-c', code])
+        c.shutdown_timeout = 0.2
+        c.send_request(c.build_notification('notifications/initialized'))
+        process = c.process
+        started = time.monotonic()
+        c.close()
+        ok(time.monotonic() - started >= 0.2 * timeouts, f'{signal_.name} after {timeouts} timeouts')
+        is_ok(process.signal_code, signal_, f'{signal_.name}')
+        is_ok(c.process, None, 'ended')
+
+    # In a coroutine, with an asynchronous block
+    async def main():
+        async with Pyjo.MCP.Client.new(command=[sys.executable, CALCULATOR, 'stdio']) as client:
+            result = await client.call_tool_p('subtract', {'a': 3, 'b': 1})
+        return result['structuredContent'], client.process
+
+    results = []
+    Pyjo.Promise.new(main()).then(results.append).wait()
+    is_deeply_ok(results, [(2, None)], 'async with')
 
 done_testing()

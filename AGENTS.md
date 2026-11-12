@@ -127,6 +127,34 @@ streams its response writes, is not parsed by `Pyjo.Content`: its events stay
 in the body, which the client parses at the end. Every other message of the
 stream is the event `notification`.
 
+The transport stdio of the client is its `command`, which `Pyjo.IOLoop.ChildProcess`
+runs at the first request, with `Pyjo.IOLoop.Messages` of lines on its
+standard output and input, and not `Pyjo.JSON.RPC.serve`, whose client gives
+a request an id of its own: the client writes the request that it built and
+keeps its promise by its `id`. The specification forbids the requests of a
+server on the standard output, as the input of a multi round-trip request is
+a result, so a message of the server is a response, a message of a
+subscription, by the `subscriptionId` of its `_meta`, which goes to the
+function of `listen`, or the event `notification`. The server runs until it
+exits, which fails the requests in progress, and the next request runs it
+again, as the specification asks of a client to restart a server that exits;
+its standard error is the event `stderr`, or the standard error of the
+process without a subscriber, as the specification lets a server log there.
+`close` ends it as the specification asks: the end of its standard input,
+then `SIGTERM` and `SIGKILL` after `shutdown_timeout`. The blocking methods
+wait for their promises with the event loop, as the child process belongs to
+the reactor of the singleton, so they fail in an event loop that runs
+already, unlike the ones of Streamable HTTP, whose user agent blocks with an
+event loop of its own.
+
+A promise of a method of the client is cancellable with `cancel` of
+`Pyjo.Promise`, as the one of a coroutine that awaits it: the connection of
+Streamable HTTP closes, as `start_p` of `Pyjo.UserAgent` does, and the
+transport stdio sends `notifications/cancelled`, as it cannot close a
+connection of its own, and drops a response that comes after it. A promise of
+`then` does not cancel the promise that it follows, so the methods keep the
+cancellation of the request in the promise that they return.
+
 ## The Tests
 
 `Pyjo.MCP.Test` is a subclass of `Pyjo.Test.Pyjo`, in the package of the

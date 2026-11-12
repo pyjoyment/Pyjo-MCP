@@ -8,6 +8,7 @@ Usage: python mcp_cli.py [OPTIONS] [COMMAND] [OPTIONS]
   python mcp_cli.py hourly-forecast -p Warsaw -H 6 -f json
   python calculator.py daemon -l http://*:3001  # starts another one at port 3001
   python mcp_cli.py -u http://127.0.0.1:3001/mcp add -a 1 -b 2
+  python mcp_cli.py -c 'python calculator.py stdio' add -a 1 -b 2
 
 A command line client of the tools of a server of MCP: a tool is a command, its
 name in kebab-case, and its arguments are the options of the command, with the
@@ -18,7 +19,13 @@ tables of the lists of objects, or the JSON of its structuredContent.
 The commands are the tools of the server, so another server has other ones,
 which python mcp_cli.py lists.
 
+The client starts a server of the transport stdio itself with a command, as a
+host of MCP does, and ends it when the command of the tool is done.
+
 Options:
+  -c, --command <cmd>   Command of a server of the transport stdio, in the
+                        syntax of the shell, defaults to the value of
+                        MCP_COMMAND, in the place of the URL
   -f, --format <name>   Format of the result, "text" or "json", defaults to
                         "text"
   -h, --help            Show this summary of available options and commands
@@ -39,6 +46,7 @@ from Pyjo.Util import tablify
 import json
 import os
 import re
+import shlex
 import sys
 
 
@@ -159,8 +167,9 @@ def main(args=None):
     # The options before the command, as an option of a tool may have the name of one of them
     i = 0
     while i < len(args) and args[i].startswith('-') and args[i] != '--':
-        i += 2 if args[i] in ('-u', '--url', '-f', '--format') else 1
+        i += 2 if args[i] in ('-c', '--command', '-u', '--url', '-f', '--format') else 1
     getopt = Pyjo.GetOpt.new()
+    getopt.option('c|command=s', default=os.environ.get('MCP_COMMAND') or None)
     getopt.option('f|format=s', default='text', choices=FORMATS)
     getopt.option('h|help')
     getopt.option('u|url=s', default=os.environ.get('MCP_URL') or 'http://127.0.0.1:3000/mcp')
@@ -168,7 +177,10 @@ def main(args=None):
     if not (opts := getopt.parse(head)) or head:
         return 2
     command, rest = (args[i], args[i + 1 :]) if i < len(args) else (None, [])
-    client = Pyjo.MCP.Client.new(opts.url, ua=ua, name='mcp_cli')
+    if opts.command:
+        client = Pyjo.MCP.Client.new(command=shlex.split(opts.command), name='mcp_cli')
+    else:
+        client = Pyjo.MCP.Client.new(opts.url, ua=ua, name='mcp_cli')
     client.on(
         'invalid_tool',
         lambda client, definition, e: print(f'Tool {definition.get("name")} left out: {e.message}', file=sys.stderr),
@@ -232,6 +244,8 @@ def main(args=None):
     except Pyjo.Exception.object as e:
         print(e.message.rstrip(), file=sys.stderr)
         return 1
+    finally:
+        client.close()
 
     # The result, or the error of the tool
     if result.get('isError'):

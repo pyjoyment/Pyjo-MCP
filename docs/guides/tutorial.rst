@@ -302,6 +302,19 @@ in progress have their responses. Claude Code starts it with the command:
 
     $ claude mcp add hello -- uv run python stdio.py stdio
 
+:mod:`Pyjo.MCP.Client` starts such a server too, with its ``command``, and
+ends it when it closes, as at the end of a ``with`` block, with the same
+methods as over Streamable HTTP. Its standard error, the log of the
+application, goes to the standard error of the client, or to the event
+``stderr`` of the client:
+
+.. code-block:: python
+
+    import Pyjo.MCP.Client
+
+    with Pyjo.MCP.Client.new(command=['uv', 'run', 'python', 'stdio.py', 'stdio']) as client:
+        print(client.call_tool('greet', {'name': 'Pyjo'})['content'][0]['text'])
+
 Testing
 -------
 
