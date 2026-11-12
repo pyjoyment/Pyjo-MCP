@@ -34,6 +34,11 @@ sdk = ["mcp>=2.3.0"]
 [tool.uv.dependency-groups]
 docs = { requires-python = ">=3.14" }
 
+# Pyjoyment of Git until its release after 0.3.0, with Pyjo.Promise.cancel and the helper heartbeat, when the lowest
+# version of the dependency becomes that release
+[tool.uv.sources]
+pyjoyment = { git = "https://github.com/pyjoyment/Pyjoyment", branch = "main" }
+
 # Only the package Pyjo.MCP: the package Pyjo is the one of Pyjoyment, whose namespace extend_path keeps open
 [tool.hatch.build.targets.wheel]
 only-include = ["Pyjo/MCP"]

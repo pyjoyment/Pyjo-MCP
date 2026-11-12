@@ -186,7 +186,9 @@ class Context(Pyjo.EventEmitter.object):
     Emitted once when the client abandons the request, as when it closes the
     connection of a response of Streamable HTTP before the result, or sends
     ``notifications/cancelled`` of the request over the transport stdio, so
-    that a tool that runs long stops. ::
+    that a tool that runs long stops. A coroutine of a tool, or the promise
+    that the tool returns, is cancelled by the server, with
+    :meth:`cancellable`, and another one subscribes to the event. ::
 
         id = Pyjo.IOLoop.recurring(1, lambda: ...)
         context.on('cancelled', lambda context: Pyjo.IOLoop.remove(id))
@@ -378,6 +380,46 @@ class Context(Pyjo.EventEmitter.object):
             self._cancelled = True
             self.emit('cancelled')
         return self
+
+    def cancellable(self, promise: Pyjo.Promise.object) -> Pyjo.Promise.object:
+        """::
+
+            promise = context.cancellable(promise)
+
+        Cancel the promise with :meth:`Pyjo.Promise.Pyjo_Promise.cancel` when
+        the client abandons the request, and return a promise of its value,
+        which the server does for the promise or the coroutine of a tool, a
+        prompt, a resource and a completion: a coroutine gets the exception of
+        the cancellation of the reactor, as :class:`asyncio.CancelledError`,
+        where it waits, so that its ``finally`` blocks run, and a request of
+        :meth:`Pyjo.UserAgent.Pyjo_UserAgent.start_p` that it waits for closes
+        its connection. That cancellation rejects the returned promise with an
+        error of JSON-RPC, not of the server, which is not logged, as nothing
+        reads its response anymore. ::
+
+            # A coroutine that stops where it waits when the client goes away
+            async def slow() -> str:
+                await Pyjo.Promise.timer(60)
+                return 'Done'
+
+            promise = context.cancellable(Pyjo.Promise.new(slow()))
+        """
+
+        def cancelled(context: Context) -> None:
+            promise.cancel()
+
+        if self._cancelled:
+            promise.cancel()
+        else:
+            self.once('cancelled', cancelled)
+
+        # The cancellation of the promise, not an error of the server
+        def failed(e: Any = None) -> Pyjo.Promise.object:
+            if self._cancelled and not isinstance(e, Exception):
+                return Pyjo.Promise.reject(Pyjo.JSON.RPC.Error.new(Pyjo.JSON.RPC.INTERNAL_ERROR, 'Request cancelled'))
+            return Pyjo.Promise.reject(e)
+
+        return promise.catch(failed)
 
     def elicit(self, key: str, message: str, schema: dict[str, Any] | None = None) -> dict[str, Any]:
         """::
@@ -579,10 +621,11 @@ class Pyjo_MCP_Server(Pyjo.EventEmitter.object):
             interval = server.heartbeat
             server.heartbeat = 15
 
-        How often a subscription of Streamable HTTP sends a comment of the
-        stream of events, which keeps a connection without notifications from
-        being closed by a proxy, in seconds, ``30`` by default, or ``0`` for
-        never.
+        How often a stream of events of Streamable HTTP, as a subscription or
+        a tool that runs long, sends a comment, with the helper ``heartbeat``
+        of :mod:`Pyjoyment`, which keeps a connection without notifications
+        from being closed by a proxy, in seconds, ``30`` by default, or ``0``
+        for never.
         """
 
         self.instructions = instructions
@@ -978,12 +1021,12 @@ class Pyjo_MCP_Server(Pyjo.EventEmitter.object):
         notification of the request, of :meth:`Context.notify`, turns the
         response into a stream of events, ``text/event-stream``, where the
         ``Accept`` of the request has it, with the notifications and then the
-        response, and a connection that closes before the result cancels the
-        :class:`Context`. A subscription of ``subscriptions/listen`` is such a
-        stream, which needs the ``Accept`` and stays open, with a comment every
-        :attr:`heartbeat` seconds, until the client closes the connection, or
-        until the event loop stops gracefully, which ends the subscription with
-        its response. ::
+        response, with a comment every :attr:`heartbeat` seconds, and a
+        connection that closes before the result cancels the :class:`Context`.
+        A subscription of ``subscriptions/listen`` is such a stream, which
+        needs the ``Accept`` and stays open, until the client closes the
+        connection, or until the event loop stops gracefully, which ends the
+        subscription with its response. ::
 
             # Pyjoyment.Lite
             any('/mcp', server.to_action())
@@ -1017,6 +1060,8 @@ class Pyjo_MCP_Server(Pyjo.EventEmitter.object):
                     c.helpers.inactivity_timeout(0)
                     c.res.headers.header('X-Accel-Buffering', 'no')
                     c.write_sse()
+                    if self.heartbeat:
+                        c.helpers.heartbeat(self.heartbeat)
                 c.write_sse({'text': Pyjo.JSON.to_json(notification)})
 
             if 'text/event-stream' in (c.req.headers.accept or ''):
@@ -1115,7 +1160,9 @@ class Pyjo_MCP_Server(Pyjo.EventEmitter.object):
                 return Pyjo.Promise.reject(e)
             if inspect.iscoroutine(values):
                 values = Pyjo.Promise.new(values)
-            promise = values if isinstance(values, Pyjo.Promise.object) else Pyjo.Promise.resolve(values)
+            promise = (
+                context.cancellable(values) if isinstance(values, Pyjo.Promise.object) else Pyjo.Promise.resolve(values)
+            )
 
         def result(values: Any = None) -> dict[str, Any]:
             values = [str(v) for v in cast(list[Any], values or [])]
@@ -1247,14 +1294,11 @@ class Pyjo_MCP_Server(Pyjo.EventEmitter.object):
         promise = Pyjo.Promise.new()
         subscriptions = self._subscriptions
         loop = Pyjo.IOLoop.singleton
-        timer: str | None = None
         finish: Any = None
 
         def remove() -> None:
             if subscription in subscriptions:
                 subscriptions.remove(subscription)
-            if timer is not None:
-                loop.remove(timer)
             if finish is not None:
                 loop.unsubscribe('finish', finish)
 
@@ -1273,10 +1317,8 @@ class Pyjo_MCP_Server(Pyjo.EventEmitter.object):
         subscriptions.append(subscription)
         subscription.notify('notifications/subscriptions/acknowledged', {'notifications': honored})
 
-        # A connection of HTTP gets the comments that keep it open, and ends with a graceful stop of the event loop
-        if (c := context.controller) is not None:
-            if self.heartbeat:
-                timer = loop.recurring(self.heartbeat, lambda loop: c.write_sse({'comment': 'keepalive'}))
+        # A connection of HTTP ends with a graceful stop of the event loop
+        if context.controller is not None:
 
             def stopping(loop: Any) -> None:
                 end()

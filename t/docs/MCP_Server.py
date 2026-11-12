@@ -2,6 +2,7 @@ import Pyjo.IOLoop
 import Pyjo.JSON.RPC
 import Pyjo.MCP.Server
 import Pyjo.MCP.Test
+import Pyjo.Promise
 import Pyjoyment
 
 from Pyjo.Test import *
@@ -199,6 +200,28 @@ with subtest('Context.cancel'):
     context = context.cancel()
     ok(context.is_cancelled, 'cancelled')
     is_ok(context.notify('notifications/message'), False, 'no notification of an abandoned request')
+
+with subtest('Context.cancellable'):
+    context = Pyjo.MCP.Server.Context.new()
+    stopped = []
+
+    # A coroutine that stops where it waits when the client goes away
+    async def slow() -> str:
+        try:
+            await Pyjo.Promise.timer(60)
+        finally:
+            stopped.append(True)
+        return 'Done'
+
+    promise = context.cancellable(Pyjo.Promise.new(slow()))
+    Pyjo.IOLoop.timer(0.01, lambda loop: context.cancel())
+    errors = []
+    promise.catch(errors.append).wait()
+    is_ok(errors[0].message, 'Request cancelled', 'error of JSON-RPC')
+    is_deeply_ok(stopped, [True], 'coroutine cancelled')
+    errors.clear()
+    context.cancellable(Pyjo.Promise.new(slow())).catch(errors.append).wait()
+    is_ok(errors[0].code, Pyjo.JSON.RPC.INTERNAL_ERROR, 'already cancelled')
 
 with subtest('Context.elicit'):
     context = Pyjo.MCP.Server.Context.new()

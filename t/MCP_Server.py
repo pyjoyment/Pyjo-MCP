@@ -786,6 +786,34 @@ with subtest('Completion'):
     tc.error_is({'code': -32602, 'message': 'Invalid argument'})
     tc.ua.close()
 
+    # The coroutine of a completion that the cancellation of the request stops where it waits
+    stopped = []
+    exceptions = []
+    completing.on('exception', lambda server, e, context: exceptions.append(e))
+
+    async def slowly(value, arguments):
+        try:
+            await Pyjo.Promise.timer(5)
+        finally:
+            stopped.append(True)
+        return []
+
+    completing.resource('slow://{n}', lambda n: n, name='slow', complete={'n': slowly})
+    context = Pyjo.MCP.Server.Context.new()
+    params = {
+        'ref': {'type': 'ref/resource', 'uri': 'slow://{n}'},
+        'argument': {'name': 'n', 'value': ''},
+        '_meta': META,
+    }
+    results = []
+    promise = completing.dispatch_p(
+        {'jsonrpc': '2.0', 'id': 1, 'method': 'completion/complete', 'params': params}, context
+    )
+    Pyjo.IOLoop.timer(0.01, lambda loop: context.cancel())
+    promise.then(results.append).wait()
+    is_deeply_ok(results[0]['error'], {'code': -32603, 'message': 'Request cancelled'}, 'cancelled')
+    is_deeply_ok((stopped, exceptions), ([True], []), 'coroutine cancelled without an error of the server')
+
     plain = Pyjo.MCP.Server.new()
     plain.prompt('review', lambda code: code)
     result = plain.dispatch_p({'jsonrpc': '2.0', 'id': 1, 'method': 'server/discover', 'params': {'_meta': META}})
@@ -873,6 +901,45 @@ with subtest('Notifications'):
     is_deeply_ok(cancelled, [True], 'cancelled')
     Pyjo.Promise.timer(0.5).wait()
     is_deeply_ok(cancelled, [True], 'once')
+
+    # The coroutine of a tool that the client abandons stops where it waits, which is not an error of the server
+    stopped = []
+    exceptions = []
+    notifying.on('exception', lambda server, e, context: exceptions.append(e))
+
+    @notifying.tool(context=True)
+    async def sleepy(context) -> str:
+        context.notify_progress(0)
+        try:
+            await Pyjo.Promise.timer(5)
+        finally:
+            stopped.append(True)
+        return 'Too late'
+
+    request = n.client.build_request('tools/call', {'name': 'sleepy', 'arguments': {}, '_meta': meta})
+    tx = n.client.build_tx(request)
+    tx.res.content.on('sse', interrupt)
+    n.ua.start(tx)
+    Pyjo.Promise.timer(0.1).wait()
+    is_deeply_ok(stopped, [True], 'coroutine cancelled')
+    is_deeply_ok(exceptions, [], 'no error of the server')
+
+    # The comments of a stream of a tool that runs long
+    notifying.heartbeat = 0.05
+
+    @notifying.tool(context=True)
+    def pause(context) -> str:
+        context.notify_progress(0)
+        return Pyjo.Promise.timer(0.2, 'Paused')
+
+    tx = n.client.build_tx(n.client.build_request('tools/call', {'name': 'pause', 'arguments': {}, '_meta': meta}))
+    read = []
+    tx.on('connection', lambda tx, id: n.ua.ioloop.stream(id).on('read', lambda stream, chunk: read.append(chunk)))
+    n.ua.start(tx, lambda ua, tx: None)
+    Pyjo.Promise.timer(0.3).wait()
+    ok(b''.join(read).count(b'\r\n: heartbeat\r\n') > 1, 'comments of the stream of a tool')
+    ok(b'Paused' in b''.join(read), 'result after the comments')
+    notifying.heartbeat = 0
     n.ua.close()
 
     # The transport stdio, whose notifications are messages of the stream before the response
@@ -969,7 +1036,7 @@ with subtest('Subscriptions'):
     tx.res.content.on('sse', lambda content, event=None: event and events.append(json.loads(event['text'])))
     s.ua.start(tx, lambda ua, tx: None)
     Pyjo.Promise.timer(0.2).wait()
-    ok(b''.join(read).count(b'\r\n: keepalive\r\n') > 1, 'comments of the stream of events')
+    ok(b''.join(read).count(b'\r\n: heartbeat\r\n') > 1, 'comments of the stream of events')
     is_deeply_ok(
         events[0]['params']['notifications'], {'promptsListChanged': True, 'resourceSubscriptions': ['a']}, 'honored'
     )
@@ -1042,6 +1109,25 @@ with subtest('Subscriptions'):
     Pyjo.Promise.timer(0.01).wait()
     ok(waiting[0][0].is_cancelled, 'tool cancelled')
     is_ok(len(peer.sent), 4, 'no responses of cancelled requests')
+
+    # The coroutine of a tool that the peer cancels stops where it waits
+    stopped = []
+
+    @listening.tool
+    async def sleepy() -> str:
+        try:
+            await Pyjo.Promise.timer(5)
+        finally:
+            stopped.append(True)
+        return 'Too late'
+
+    params = {'name': 'sleepy', 'arguments': {}, '_meta': META}
+    peer.emit('message', json.dumps({'jsonrpc': '2.0', 'id': 5, 'method': 'tools/call', 'params': params}))
+    Pyjo.Promise.timer(0.01).wait()
+    peer.emit('message', json.dumps({**cancel, 'params': {'requestId': 5}}))
+    Pyjo.Promise.timer(0.01).wait()
+    is_deeply_ok(stopped, [True], 'coroutine cancelled')
+    is_ok(len(peer.sent), 4, 'no response of the cancelled coroutine')
 
     peer.emit('end')
     Pyjo.Promise.timer(0.01).wait()

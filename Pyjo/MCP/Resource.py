@@ -167,7 +167,10 @@ class Pyjo_MCP_Resource(Pyjo.Base.object):
 
         Call the function, and return a :mod:`Pyjo.Promise` of the result of
         the resource, as ``resources/read`` gives it, without its
-        ``resultType``, or rejected with an exception of the function. ::
+        ``resultType``, or rejected with an exception of the function. A promise
+        or a coroutine of the function is cancelled with the
+        :class:`Pyjo.MCP.Server.Context` of the request, as
+        :meth:`Pyjo.MCP.Server.Context.cancellable` does. ::
 
             # {'contents': [{'uri': 'file:///project/README.md', 'mimeType': 'text/markdown', 'text': '# Pyjo-MCP'}]}
             resource.read_p().then(print).wait()
@@ -179,6 +182,8 @@ class Pyjo_MCP_Resource(Pyjo.Base.object):
         if inspect.iscoroutine(value):
             value = Pyjo.Promise.new(value)
         if isinstance(value, Pyjo.Promise.object):
+            if context is not None:
+                value = context.cancellable(value)
             return value.then(self.result)
         return Pyjo.Promise.resolve(self.result(value))
 

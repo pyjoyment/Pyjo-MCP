@@ -47,10 +47,25 @@ one, is answered with JSON, as before, where `MCP::Server` of the Perl `MCP`
 opens the stream for every result that is a promise. The stream needs a client
 that has `text/event-stream` in its `Accept`; for another one the notifications
 go nowhere and the result is JSON. The stream has no inactivity timeout, as a
-tool may take long between two notifications, and `X-Accel-Buffering: no`, so
-that nginx passes each event at once. The connection of the stream that closes
-before the result cancels the `Context`, which emits `cancelled` once, and the
-result of a cancelled request is not written. A notification that the client
+tool may take long between two notifications, a comment every `heartbeat`
+seconds, of the helper `heartbeat` of Pyjoyment, which keeps a proxy from
+closing it, and `X-Accel-Buffering: no`, so that nginx passes each event at
+once. The connection of the stream that closes before the result cancels the
+`Context`, which emits `cancelled` once, and the result of a cancelled request
+is not written.
+
+The promise of a tool, a prompt, a resource or a completion, or the one of its
+coroutine, is cancelled with the `Context`, by `Context.cancellable` and
+`cancel` of `Pyjo.Promise`, as Pyjoyment cancels an action that is a
+coroutine when its connection closes: the coroutine gets the exception of the
+cancellation of the reactor where it waits, and a request of `Pyjo.UserAgent`
+that it waits for closes its connection, so that a request to a slow service
+stops too. The action of `to_action` is not a coroutine, so Pyjoyment does not
+cancel it itself. The cancellation is a `BaseException`, which
+`Pyjo.JSON.RPC` would log as an error of the server, so `cancellable` rejects
+its promise with an error of JSON-RPC instead, whose response is not written
+anyway. With the reactor of asyncio, a coroutine whose task has not started
+yet does not run at all, so its `finally` blocks do not run either. A notification that the client
 did not ask for, progress without a `progressToken` or a log message below its
 `logLevel`, is not sent at all.
 
@@ -212,9 +227,8 @@ A server ends a subscription with a response, not with `notifications/cancelled`
 which the page of the cancellation names for it: the page of the subscriptions,
 which describes the graceful closure, gives the response. Over Streamable HTTP, the event `finish` of the event loop, which a graceful
 stop emits, ends the subscriptions of its connections, as a stream that stays
-open would keep the server waiting until its timeout, and a recurring timer
-writes a comment of the stream every `heartbeat` seconds, which keeps a proxy
-from closing it. Over stdio, the end of the input ends the subscriptions of its
+open would keep the server waiting until its timeout, and its comments every
+`heartbeat` seconds are those of any stream of events. Over stdio, the end of the input ends the subscriptions of its
 peer, as `Pyjo.JSON.RPC.serve` closes the stream only once the requests in
 progress have their responses.
 
@@ -296,7 +310,11 @@ mise exec -- uv run --group sdk --with-editable ../Pyjoyment python -m Pyjo.Prov
 ## Development
 
 The distribution depends on the release of Pyjoyment on PyPI, with the lowest
-version that has what it uses, which `uv.lock` pins. A change of Pyjoyment that
+version that has what it uses, which `uv.lock` pins. Until the release after
+0.3.0, it uses `cancel` of `Pyjo.Promise` and the helper `heartbeat` of the
+branch `main` of Pyjoyment, of `[tool.uv.sources]`, while its lowest version
+stays 0.3.0, which the workflow Build installs from PyPI to import the wheel:
+the release replaces both, the source and the lowest version. A change of Pyjoyment that
 is not released yet would be its Git repository in `[tool.uv.sources]` of
 `pyproject.toml`, until its release, and not a path to the checkout next to
 this one: uv applies the sources of a dependency of Git, so whoever installs
