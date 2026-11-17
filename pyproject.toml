@@ -11,7 +11,7 @@ license = "Artistic-2.0"
 license-files = ["LICENSE"]
 authors = [{ name = "Piotr Roszatycki", email = "piotr.roszatycki@gmail.com" }]
 requires-python = ">=3.12"
-dependencies = ["Pyjoyment>=0.3.0"]
+dependencies = ["Pyjoyment>=0.4.0"]
 keywords = ["pyjoyment", "mcp", "model-context-protocol"]
 classifiers = [
   "Development Status :: 2 - Pre-Alpha",
@@ -33,11 +33,6 @@ sdk = ["mcp>=2.3.0"]
 # of the distribution, which a new Sphinx may not support, as Sphinx 9.2 does not support 3.12
 [tool.uv.dependency-groups]
 docs = { requires-python = ">=3.14" }
-
-# Pyjoyment of Git until its release after 0.3.0, with Pyjo.Promise.cancel and the helper heartbeat, when the lowest
-# version of the dependency becomes that release
-[tool.uv.sources]
-pyjoyment = { git = "https://github.com/pyjoyment/Pyjoyment", branch = "main" }
 
 # Only the package Pyjo.MCP: the package Pyjo is the one of Pyjoyment, whose namespace extend_path keeps open
 [tool.hatch.build.targets.wheel]
