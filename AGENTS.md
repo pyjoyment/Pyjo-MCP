@@ -338,11 +338,7 @@ mise exec -- uv run --group sdk --with-editable ../Pyjoyment python -m Pyjo.Prov
 ## Development
 
 The distribution depends on the release of Pyjoyment on PyPI, with the lowest
-version that has what it uses, which `uv.lock` pins. Until the release after
-0.3.0, it uses `cancel` of `Pyjo.Promise` and the helper `heartbeat` of the
-branch `main` of Pyjoyment, of `[tool.uv.sources]`, while its lowest version
-stays 0.3.0, which the workflow Build installs from PyPI to import the wheel:
-the release replaces both, the source and the lowest version. A change of Pyjoyment that
+version that has what it uses, which `uv.lock` pins. A change of Pyjoyment that
 is not released yet would be its Git repository in `[tool.uv.sources]` of
 `pyproject.toml`, until its release, and not a path to the checkout next to
 this one: uv applies the sources of a dependency of Git, so whoever installs
