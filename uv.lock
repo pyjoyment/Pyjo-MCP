@@ -817,8 +817,8 @@ sdk = [{ name = "mcp", specifier = ">=2.3.0" }]
 
 [[package]]
 name = "pyjoyment"
-version = "0.5.0.dev1"
-source = { git = "https://github.com/pyjoyment/Pyjoyment?branch=main#5a5e163fbfaf54e072a7fb4febdce9d44cc2bdc8" }
+version = "0.5.1.dev1"
+source = { git = "https://github.com/pyjoyment/Pyjoyment?branch=main#20a88227935c8c72a8dc81227af17ba1d9da72e4" }
 
 [[package]]
 name = "pyjwt"
